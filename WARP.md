@@ -113,3 +113,14 @@ Example: `multiflexi~bookworm_1.0.0_all.deb` → distribution: `bookworm`
 4. **Documentation**: Update README.md for usage instructions
 
 The repository follows Infrastructure as Code principles with pipeline definition versioned alongside configuration scripts.
+
+## Agent Operation Rule: Always Commit and Push
+
+- After applying any change to this repository (code, scripts, or docs), immediately:
+  - `git add -A`
+  - `git commit -m "<concise change summary>"`
+  - `git push origin HEAD`
+- Prefer a clear, actionable commit message (present tense, concise summary on the first line).
+- If multiple related edits are made in sequence, it is acceptable to push once at the end of the sequence, but do not leave the working tree dirty.
+- If a push is rejected due to remote updates, perform `git pull --rebase` and retry `git push`.
+- Do not commit any credentials or secrets.

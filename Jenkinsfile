@@ -23,69 +23,77 @@ parameters {
       }
       steps {
         script {
-          def upstream = params.UPSTREAM_JOB?.trim(); if (!upstream) { error('UPSTREAM_JOB is required') }
-          def projectPath = upstream.contains('/') ? upstream : "MultiFlexi/${upstream}"
+          // Determine upstream job/build from UpstreamCause or fallback to params
+          def upJob = params.UPSTREAM_JOB?.trim()
+          def upBuild = params.UPSTREAM_BUILD?.trim()
+          def cause = currentBuild.rawBuild?.getCause(hudson.model.Cause$UpstreamCause)
+          if (!upJob && cause) { upJob = cause.upstreamProject }
+          if (!upBuild && cause) { upBuild = (cause.upstreamBuild as String) }
+          if (!upJob) { error('Unable to determine upstream job name') }
+          def projectPath = upJob.contains('/') ? upJob : "MultiFlexi/${upJob}"
           def projectPathJob = projectPath.split('/').collect{ "job/${it}" }.join('/')
           def configUrl = "${params.JENKINS_URL}/${projectPathJob}/config.xml"
           def currentJobFullName = env.JOB_NAME
-          sh label: 'Ensure Copy Artifact permission on upstream', script: """
-            set -e
-            JENKINS_URL='${params.JENKINS_URL}'
-            CONFIG_URL='${configUrl}'
-            USER='${params.JENKINS_USER}'
-            TOKEN='${params.JENKINS_TOKEN}'
-            JOB_FULL_NAME='${currentJobFullName}'
+          withEnv([
+            "JENKINS_URL=${params.JENKINS_URL}",
+            "CONFIG_URL=${configUrl}",
+            "JENKINS_USER=${params.JENKINS_USER}",
+            "JENKINS_TOKEN=${params.JENKINS_TOKEN}",
+            "JOB_FULL_NAME=${currentJobFullName}"
+          ]) {
+            sh label: 'Ensure Copy Artifact permission on upstream', script: '''
+              set -e
+              CRUMB_JSON=$(curl -sf -u "$JENKINS_USER:$JENKINS_TOKEN" "$JENKINS_URL/crumbIssuer/api/json" || true)
+              CRUMB=$(echo "$CRUMB_JSON" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+              CRUMB_FIELD=$(echo "$CRUMB_JSON" | sed -n 's/.*"crumbRequestField"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
-            # Fetch crumb (if any)
-            CRUMB_JSON=\$(curl -sf -u \"\$USER:\$TOKEN\" \"\$JENKINS_URL/crumbIssuer/api/json\" || true)
-            CRUMB=\$(echo \"\$CRUMB_JSON\" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p')
-            CRUMB_FIELD=\$(echo \"\$CRUMB_JSON\" | sed -n 's/.*"crumbRequestField"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p')
+              TMP=$(mktemp)
+              curl -sf -u "$JENKINS_USER:$JENKINS_TOKEN" "$CONFIG_URL" > "$TMP" || true
 
-            TMP=\$(mktemp)
-            curl -sf -u \"\$USER:\$TOKEN\" \"\$CONFIG_URL\" > \"\$TMP\"
+              if grep -q "CopyArtifactPermissionProperty" "$TMP"; then
+                if grep -q "<string>$JOB_FULL_NAME</string>" "$TMP"; then
+                  echo "CopyArtifact permission already present for $JOB_FULL_NAME"
+                  rm -f "$TMP"
+                  exit 0
+                fi
+                awk -v job="$JOB_FULL_NAME" '
+                  {print}
+                  /<projectNameList>/ {inlist=1}
+                  inlist && /<\/projectNameList>/ {print "    <string>"job"</string>"; inlist=0}
+                ' "$TMP" > "$TMP.new"
+              else
+                awk -v job="$JOB_FULL_NAME" '
+                  BEGIN{inserted=0}
+                  {
+                    print
+                    if(!inserted && $0 ~ /<properties>/){
+                      print "    <hudson.plugins.copyartifact.CopyArtifactPermissionProperty>"
+                      print "      <projectNameList>"
+                      print "        <string>" job "</string>"
+                      print "      </projectNameList>"
+                      print "    </hudson.plugins.copyartifact.CopyArtifactPermissionProperty>"
+                      inserted=1
+                    }
+                  }
+                ' "$TMP" > "$TMP.new"
+              fi
 
-            if grep -q "CopyArtifactPermissionProperty" \"\$TMP\"; then
-              if grep -q "<string>\$JOB_FULL_NAME</string>" \"\$TMP\"; then
-                echo "CopyArtifact permission already present for \$JOB_FULL_NAME"
-                rm -f \"\$TMP\"
+              if cmp -s "$TMP" "$TMP.new"; then
+                echo "No changes required to config.xml"
+                rm -f "$TMP" "$TMP.new"
                 exit 0
               fi
-              awk -v job=\"\$JOB_FULL_NAME\" '
-                {print}
-                /<projectNameList>/ {inlist=1}
-                inlist && /<\/projectNameList>/ {print "    <string>"job"</string>"; inlist=0}
-              ' \"\$TMP\" > \"\$TMP.new\"
-            else
-              awk -v job=\"\$JOB_FULL_NAME\" '
-                BEGIN{inserted=0}
-                {
-                  print
-                  if(!inserted && $0 ~ /<properties>/){
-                    print "    <hudson.plugins.copyartifact.CopyArtifactPermissionProperty>"
-                    print "      <projectNameList>"
-                    print "        <string>" job "</string>"
-                    print "      </projectNameList>"
-                    print "    </hudson.plugins.copyartifact.CopyArtifactPermissionProperty>"
-                    inserted=1
-                  }
-                }
-              ' \"\$TMP\" > \"\$TMP.new\"
-            fi
 
-            if cmp -s \"\$TMP\" \"\$TMP.new\"; then
-              echo "No changes required to config.xml"
-              rm -f \"\$TMP\" \"\$TMP.new\"
-              exit 0
-            fi
-
-            if [ -n \"\$CRUMB\" ] && [ -n \"\$CRUMB_FIELD\" ]; then
-              curl -sf -u \"\$USER:\$TOKEN\" -H \"\$CRUMB_FIELD: \$CRUMB\" -H 'Content-Type: application/xml' -X POST --data-binary @\"\$TMP.new\" \"\$CONFIG_URL\"
-            else
-              curl -sf -u \"\$USER:\$TOKEN\" -H 'Content-Type: application/xml' -X POST --data-binary @\"\$TMP.new\" \"\$CONFIG_URL\"
-            fi
-            echo "Upstream config.xml updated to allow Copy Artifact from \$JOB_FULL_NAME"
-            rm -f \"\$TMP\" \"\$TMP.new\"
-          """
+              if [ -n "$CRUMB" ] && [ -n "$CRUMB_FIELD" ]; then
+                curl -sf -u "$JENKINS_USER:$JENKINS_TOKEN" -H "$CRUMB_FIELD: $CRUMB" -H 'Content-Type: application/xml' -X POST --data-binary @"$TMP.new" "$CONFIG_URL"
+              else
+                curl -sf -u "$JENKINS_USER:$JENKINS_TOKEN" -H 'Content-Type: application/xml' -X POST --data-binary @"$TMP.new" "$CONFIG_URL"
+              fi
+              echo "Upstream config.xml updated to allow Copy Artifact from $JOB_FULL_NAME"
+              rm -f "$TMP" "$TMP.new"
+            '''
+          }
+        }
         }
       }
     }
@@ -94,12 +102,17 @@ stage('Fetch artifacts') {
         // Clean previous .deb files from workspace to avoid re-uploading old builds
         sh 'rm -f *.deb 2>/dev/null || true'
         script {
-          def upstream = params.UPSTREAM_JOB?.trim(); if (!upstream) { error('UPSTREAM_JOB is required') }
-          def buildNum = params.UPSTREAM_BUILD?.trim(); if (!buildNum) { error('UPSTREAM_BUILD is required') }
-          def projectPath = upstream.contains('/') ? upstream : "MultiFlexi/${upstream}"
+          // Determine upstream job/build from UpstreamCause or fallback to params
+          def upJob = params.UPSTREAM_JOB?.trim()
+          def upBuild = params.UPSTREAM_BUILD?.trim()
+          def cause = currentBuild.rawBuild?.getCause(hudson.model.Cause$UpstreamCause)
+          if (!upJob && cause) { upJob = cause.upstreamProject }
+          if (!upBuild && cause) { upBuild = (cause.upstreamBuild as String) }
+          if (!upJob || !upBuild) { error('Unable to determine upstream job and build') }
+          def projectPath = upJob.contains('/') ? upJob : "MultiFlexi/${upJob}"
           // Copy Artifact plugin often requires '/job/.../job/...' style for foldered jobs
           def projectPathCA = "/job/${projectPath.replace('/', '/job/')}"
-          echo "Copying .deb artifacts from ${projectPath} (#${buildNum})"
+          echo "Copying .deb artifacts from ${projectPath} (#${upBuild})"
           echo "Resolved Copy Artifact path: ${projectPathCA}"
           
           // Try multiple approaches to get artifacts
@@ -107,7 +120,7 @@ stage('Fetch artifacts') {
           
           // Method 1: Direct project path using '/job/..' style
           try {
-            copyArtifacts projectName: projectPathCA, selector: specific(buildNum), filter: '**/dist/debian/*.deb, **/*.deb', flatten: true, optional: true
+            copyArtifacts projectName: projectPathCA, selector: specific(upBuild), filter: '**/dist/debian/*.deb, **/*.deb', flatten: true, optional: true
             echo "Successfully copied artifacts from ${projectPathCA}"
             copySuccess = true
           } catch (Exception e1) {
@@ -119,7 +132,7 @@ stage('Fetch artifacts') {
               def simpleJobCA = "/job/${simpleJobName.replace('/', '/job/')}"
               try {
                 echo "Trying alternate project path (CA): ${simpleJobCA}"
-                copyArtifacts projectName: simpleJobCA, selector: specific(buildNum), filter: '**/dist/debian/*.deb, **/*.deb', flatten: true, optional: true
+                copyArtifacts projectName: simpleJobCA, selector: specific(upBuild), filter: '**/dist/debian/*.deb, **/*.deb', flatten: true, optional: true
                 echo "Successfully copied artifacts from ${simpleJobCA}"
                 copySuccess = true
               } catch (Exception e2) {
@@ -154,40 +167,42 @@ stage('Fetch artifacts') {
           // Method 4: HTTP download via Jenkins API (requires JENKINS_USER/TOKEN)
           if (!copySuccess && params.JENKINS_USER?.trim() && params.JENKINS_TOKEN?.trim() && params.JENKINS_URL?.trim()) {
             echo "Attempting HTTP download of artifacts via Jenkins API..."
-            def httpStatus = sh(returnStatus: true, label: 'HTTP download .deb artifacts', script: """
-              set -e
-              JENKINS_URL='${params.JENKINS_URL}'
-              USER='${params.JENKINS_USER}'
-              TOKEN='${params.JENKINS_TOKEN}'
-              UPSTREAM='${projectPath}'
-              BUILD='${buildNum}'
-              # Build /job/.../job/... path
-              JOB_PATH=\$(awk -v p=\"\$UPSTREAM\" 'BEGIN{n=split(p,a,"/"); for(i=1;i<=n;i++) printf "/job/%s", a[i]}')
-              JSON_URL=\"\$JENKINS_URL\$JOB_PATH/\$BUILD/api/json?tree=artifacts[fileName,relativePath]\"
+            withEnv([
+              "JENKINS_URL=${params.JENKINS_URL}",
+              "JENKINS_USER=${params.JENKINS_USER}",
+              "JENKINS_TOKEN=${params.JENKINS_TOKEN}",
+              "UPSTREAM=${projectPath}",
+              "BUILD=${upBuild}"
+            ]) {
+              def httpStatus = sh(returnStatus: true, label: 'HTTP download .deb artifacts', script: '''
+                set -e
+                JOB_PATH=$(awk -v p="$UPSTREAM" 'BEGIN{n=split(p,a,"/"); for(i=1;i<=n;i++) printf "/job/%s", a[i]}')
+                JSON_URL="$JENKINS_URL$JOB_PATH/$BUILD/api/json?tree=artifacts[fileName,relativePath]"
 
-              if command -v jq >/dev/null 2>&1; then
-                rels=\$(curl -sf -u \"\$USER:\$TOKEN\" \"\$JSON_URL\" | jq -r '.artifacts[] | select(.fileName|endswith(\".deb\")) | .relativePath' || true)
-                if [ -n \"\$rels\" ]; then
-                  echo \"\$rels\" | while IFS= read -r rel; do
-                    echo \"Downloading: \$rel\"
-                    curl -sfL -u \"\$USER:\$TOKEN\" -o \"\$(basename \"\$rel\")\" \"\$JENKINS_URL\$JOB_PATH/\$BUILD/artifact/\$rel\"
-                  done
+                if command -v jq >/dev/null 2>&1; then
+                  rels=$(curl -sf -u "$JENKINS_USER:$JENKINS_TOKEN" "$JSON_URL" | jq -r '.artifacts[] | select(.fileName|endswith(".deb")) | .relativePath' || true)
+                  if [ -n "$rels" ]; then
+                    echo "$rels" | while IFS= read -r rel; do
+                      echo "Downloading: $rel"
+                      curl -sfL -u "$JENKINS_USER:$JENKINS_TOKEN" -o "$(basename "$rel")" "$JENKINS_URL$JOB_PATH/$BUILD/artifact/$rel"
+                    done
+                  else
+                    echo "No .deb artifacts listed by Jenkins API JSON"
+                  fi
                 else
-                  echo \"No .deb artifacts listed by Jenkins API JSON\"
+                  echo "jq not found; falling back to ZIP download of dist/debian"
+                  curl -sfL -u "$JENKINS_USER:$JENKINS_TOKEN" -o debian.zip "$JENKINS_URL$JOB_PATH/$BUILD/artifact/dist/debian/*zip*/debian.zip" || true
+                  if [ -s debian.zip ]; then
+                    unzip -o debian.zip >/dev/null
+                    # move any extracted debs into workspace root
+                    find . -maxdepth 3 -type f -name '*.deb' -exec sh -c 'for f; do base=$(basename "$f"); [ -f "$base" ] || cp -f "$f" ./; done' sh {} +
+                    rm -f debian.zip
+                  else
+                    echo "ZIP download not available"
+                  fi
                 fi
-              else
-                echo \"jq not found; falling back to ZIP download of dist/debian\"
-                curl -sfL -u \"\$USER:\$TOKEN\" -o debian.zip \"\$JENKINS_URL\$JOB_PATH/\$BUILD/artifact/dist/debian/*zip*/debian.zip\" || true
-                if [ -s debian.zip ]; then
-                  unzip -o debian.zip >/dev/null
-                  # move any extracted debs into workspace root
-                  find . -maxdepth 3 -type f -name '*.deb' -exec sh -c 'for f; do base=\$(basename "\$f"); [ -f "\$base" ] || cp -f "\$f" ./; done' sh {} +
-                  rm -f debian.zip
-                else
-                  echo \"ZIP download not available\"
-                fi
-              fi
-            """)
+              ''')
+            }
             def hasHttpDebs = sh(returnStatus: true, script: 'ls -1 *.deb >/dev/null 2>&1') == 0
             if (hasHttpDebs) {
               copySuccess = true
