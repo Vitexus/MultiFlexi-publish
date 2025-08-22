@@ -1,12 +1,27 @@
 
 import groovy.json.JsonSlurperClassic
+import com.cloudbees.groovy.cps.NonCPS
+
+@NonCPS
+def resolveUpstreamFromRaw() {
+  def raw = currentBuild?.rawBuild
+  def uc = raw?.getCause(hudson.model.Cause$UpstreamCause)
+  if (uc) {
+    return [job: String.valueOf(uc.upstreamProject), build: String.valueOf(uc.upstreamBuild)]
+  }
+  def buc = raw?.getCause(org.jenkinsci.plugins.workflow.support.steps.build.BuildUpstreamCause)
+  if (buc) {
+    return [job: String.valueOf(buc.upstreamProject), build: String.valueOf(buc.upstreamBuild)]
+  }
+  return null
+}
 
 pipeline {
   agent any
 parameters {
     string(name: 'JENKINS_URL', defaultValue: 'https://jenkins.proxy.spojenet.cz', description: 'Jenkins base URL')
-    string(name: 'JENKINS_USER', defaultValue: '', description: 'Jenkins API user (optional, for auto-fix)')
-    string(name: 'JENKINS_TOKEN', defaultValue: '', description: 'Jenkins API token (optional, for auto-fix)')
+    string(name: 'JENKINS_USER', defaultValue: '', description: 'Jenkins API user (optional, for HTTP fallback)')
+    string(name: 'JENKINS_TOKEN', defaultValue: '', description: 'Jenkins API token (optional, for HTTP fallback)')
     booleanParam(name: 'AUTO_FIX_COPY_PERMISSION', defaultValue: true, description: 'Auto-fix Copy Artifact permission on upstream when credentials provided')
     string(name: 'UPSTREAM_JOB', defaultValue: '', description: 'Upstream job name or full path (e.g., composer-debian or MultiFlexi/composer-debian)')
     string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Upstream build number')
@@ -26,41 +41,43 @@ stage('Fetch artifacts') {
         // Clean previous .deb files from workspace to avoid re-uploading old builds
         sh 'rm -f *.deb 2>/dev/null || true'
         script {
-          // Determine upstream job/build from UpstreamCause or fallback to params
-          def upJob = params.UPSTREAM_JOB?.trim()
-          def upBuild = params.UPSTREAM_BUILD?.trim()
-          def cause = currentBuild.rawBuild?.getCause(hudson.model.Cause$UpstreamCause)
-          if (!upJob && cause) { upJob = cause.upstreamProject }
-          if (!upBuild && cause) { upBuild = (cause.upstreamBuild as String) }
+          // Determine upstream job/build from UpstreamCause or fallback to params (CPS-safe)
+          String upJob = params.UPSTREAM_JOB?.trim()
+          String upBuild = params.UPSTREAM_BUILD?.trim()
+          if (!upJob || !upBuild) {
+            def info = resolveUpstreamFromRaw()
+            if (info) {
+              upJob = info.job
+              upBuild = info.build
+            }
+          }
           if (!upJob || !upBuild) { error('Unable to determine upstream job and build') }
-          def projectPath = upJob.contains('/') ? upJob : "MultiFlexi/${upJob}"
-          // Copy Artifact plugin often requires '/job/.../job/...' style for foldered jobs
-          def projectPathCA = "/job/${projectPath.replace('/', '/job/')}"
+
+          // Always use foldered full name with forward slashes for copyArtifacts
+          String projectPath = upJob.contains('/') ? upJob : "MultiFlexi/${upJob}"
           echo "Copying .deb artifacts from ${projectPath} (#${upBuild})"
-          echo "Resolved Copy Artifact path: ${projectPathCA}"
           
           // Try multiple approaches to get artifacts
-          def copySuccess = false
+          boolean copySuccess = false
           
-          // Method 1: Direct project path using '/job/..' style
+          // Method 1: copyArtifacts using foldered fullName (NOT /job/... URL form)
           try {
-            copyArtifacts projectName: projectPathCA, selector: specific(upBuild), filter: '**/dist/debian/*.deb, **/*.deb', flatten: true, optional: true
-            echo "Successfully copied artifacts from ${projectPathCA}"
+            copyArtifacts projectName: projectPath, selector: specific(upBuild), filter: '**/dist/debian/*.deb, **/*.deb', flatten: true, optional: true
+            echo "Successfully copied artifacts from ${projectPath}"
             copySuccess = true
           } catch (Exception e1) {
-            echo "Method 1 failed: ${e1.getMessage()}"
+            echo "Method 1 failed: ${e1.getClass().getName()}"
             
-            // Method 2: Try without MultiFlexi prefix if it was added (both plain and '/job/' styles)
+            // Method 2: Try without MultiFlexi prefix if present
             if (projectPath.startsWith('MultiFlexi/')) {
               def simpleJobName = projectPath.replace('MultiFlexi/', '')
-              def simpleJobCA = "/job/${simpleJobName.replace('/', '/job/')}"
               try {
-                echo "Trying alternate project path (CA): ${simpleJobCA}"
-                copyArtifacts projectName: simpleJobCA, selector: specific(upBuild), filter: '**/dist/debian/*.deb, **/*.deb', flatten: true, optional: true
-                echo "Successfully copied artifacts from ${simpleJobCA}"
+                echo "Trying alternate project path: ${simpleJobName}"
+                copyArtifacts projectName: simpleJobName, selector: specific(upBuild), filter: '**/dist/debian/*.deb, **/*.deb', flatten: true, optional: true
+                echo "Successfully copied artifacts from ${simpleJobName}"
                 copySuccess = true
               } catch (Exception e2) {
-                echo "Method 2 failed: ${e2.getMessage()}"
+                echo "Method 2 failed: ${e2.getClass().getName()}"
               }
             }
           }
@@ -69,7 +86,7 @@ stage('Fetch artifacts') {
             echo "Warning: All artifact copy methods failed for project '${projectPath}'"
             echo "Attempting direct file system access as fallback..."
             
-            // Method 3: Direct file system access as last resort (use workspace path, not '/job' URL path)
+            // Method 3: Direct file system access as last resort (use workspace path)
             try {
               def workspacePattern = "/var/lib/jenkins/workspace/${projectPath}/"
               def foundFiles = sh(returnStdout: true, script: "find \\\"${workspacePattern}\\\" -name '*.deb' -type f 2>/dev/null | head -10 || echo 'NO_FILES_FOUND'").trim()
@@ -84,12 +101,12 @@ stage('Fetch artifacts') {
                 }
               }
             } catch (Exception e3) {
-              echo "Method 3 (direct access) failed: ${e3.getMessage()}"
+              echo "Method 3 (direct access) failed: ${e3.getClass().getName()}"
             }
           }
           
-          // Method 4: HTTP download via Jenkins API (requires JENKINS_USER/TOKEN)
-          if (!copySuccess && params.JENKINS_USER?.trim() && params.JENKINS_TOKEN?.trim() && params.JENKINS_URL?.trim()) {
+          // Method 4: HTTP download via Jenkins API (requires JENKINS_USER/TOKEN or credentials)
+          if (!copySuccess && params.JENKINS_URL?.trim()) {
             echo "Attempting HTTP download of artifacts via Jenkins API..."
             withEnv([
               "JENKINS_URL=${params.JENKINS_URL}",
@@ -98,24 +115,37 @@ stage('Fetch artifacts') {
               "UPSTREAM=${projectPath}",
               "BUILD=${upBuild}"
             ]) {
-              def httpStatus = sh(returnStatus: true, label: 'HTTP download .deb artifacts', script: '''
+              sh(label: 'HTTP download .deb artifacts', returnStatus: true, script: '''
+                set +x
                 set -e
                 JOB_PATH=$(awk -v p="$UPSTREAM" 'BEGIN{n=split(p,a,"/"); for(i=1;i<=n;i++) printf "/job/%s", a[i]}')
                 JSON_URL="$JENKINS_URL$JOB_PATH/$BUILD/api/json?tree=artifacts[fileName,relativePath]"
+                HOST=$(printf %s "$JENKINS_URL" | sed -E 's#https?://##; s:/.*$::')
+
+                # Build temporary netrc to avoid leaking credentials in process args
+                NETRC=$(mktemp)
+                chmod 600 "$NETRC"
+                if [ -n "$JENKINS_USER" ] && [ -n "$JENKINS_TOKEN" ]; then
+                  printf 'machine %s login %s password %s\n' "$HOST" "$JENKINS_USER" "$JENKINS_TOKEN" > "$NETRC"
+                  AUTH=(--netrc-file "$NETRC")
+                else
+                  AUTH=()
+                fi
 
                 if command -v jq >/dev/null 2>&1; then
-                  rels=$(curl -sf -u "$JENKINS_USER:$JENKINS_TOKEN" "$JSON_URL" | jq -r '.artifacts[] | select(.fileName|endswith(".deb")) | .relativePath' || true)
+                  rels=$(curl -sf "${AUTH[@]}" "$JSON_URL" | jq -r '.artifacts[] | select(.fileName|endswith(".deb")) | .relativePath' || true)
                   if [ -n "$rels" ]; then
                     echo "$rels" | while IFS= read -r rel; do
+                      [ -n "$rel" ] || continue
                       echo "Downloading: $rel"
-                      curl -sfL -u "$JENKINS_USER:$JENKINS_TOKEN" -o "$(basename "$rel")" "$JENKINS_URL$JOB_PATH/$BUILD/artifact/$rel"
+                      curl -sfL "${AUTH[@]}" -o "$(basename "$rel")" "$JENKINS_URL$JOB_PATH/$BUILD/artifact/$rel"
                     done
                   else
                     echo "No .deb artifacts listed by Jenkins API JSON"
                   fi
                 else
                   echo "jq not found; falling back to ZIP download of dist/debian"
-                  curl -sfL -u "$JENKINS_USER:$JENKINS_TOKEN" -o debian.zip "$JENKINS_URL$JOB_PATH/$BUILD/artifact/dist/debian/*zip*/debian.zip" || true
+                  curl -sfL "${AUTH[@]}" -o debian.zip "$JENKINS_URL$JOB_PATH/$BUILD/artifact/dist/debian/*zip*/debian.zip" || true
                   if [ -s debian.zip ]; then
                     unzip -o debian.zip >/dev/null
                     # move any extracted debs into workspace root
@@ -125,6 +155,8 @@ stage('Fetch artifacts') {
                     echo "ZIP download not available"
                   fi
                 fi
+
+                rm -f "$NETRC"
               ''')
             }
             def hasHttpDebs = sh(returnStatus: true, script: 'ls -1 *.deb >/dev/null 2>&1') == 0
