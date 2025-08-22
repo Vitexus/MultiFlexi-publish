@@ -44,8 +44,13 @@ parameters {
             sh label: 'Ensure Copy Artifact permission on upstream', script: '''
               set -e
               CRUMB_JSON=$(curl -sf -u "$JENKINS_USER:$JENKINS_TOKEN" "$JENKINS_URL/crumbIssuer/api/json" || true)
-              CRUMB=$(echo "$CRUMB_JSON" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-              CRUMB_FIELD=$(echo "$CRUMB_JSON" | sed -n 's/.*"crumbRequestField"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+              if command -v jq >/dev/null 2>&1; then
+                CRUMB=$(echo "$CRUMB_JSON" | jq -r '.crumb // empty')
+                CRUMB_FIELD=$(echo "$CRUMB_JSON" | jq -r '.crumbRequestField // empty')
+              else
+                CRUMB=$(echo "$CRUMB_JSON" | awk -F'"' '{for(i=1;i<NF;i++) if($i=="crumb"){print $(i+2); exit}}')
+                CRUMB_FIELD=$(echo "$CRUMB_JSON" | awk -F'"' '{for(i=1;i<NF;i++) if($i=="crumbRequestField"){print $(i+2); exit}}')
+              fi
 
               TMP=$(mktemp)
               curl -sf -u "$JENKINS_USER:$JENKINS_TOKEN" "$CONFIG_URL" > "$TMP" || true
@@ -216,7 +221,7 @@ stage('Fetch artifacts') {
             echo "ERROR: All artifact copy methods failed for project '${projectPath}'"
             echo "This may be due to:"
             echo "  - Project permissions: '${projectPath}' must allow artifact copying"
-            echo "  - Build #${buildNum} has no .deb artifacts"
+            echo "  - Build #${upBuild} has no .deb artifacts"
             echo "  - copyArtifacts plugin configuration issues"
             echo ""
             echo "To fix this:"
