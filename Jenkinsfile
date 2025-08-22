@@ -7,7 +7,7 @@ parameters {
     string(name: 'JENKINS_URL', defaultValue: 'https://jenkins.proxy.spojenet.cz', description: 'Jenkins base URL')
     string(name: 'UPSTREAM_JOB', defaultValue: '', description: 'Upstream job name or full path (e.g., composer-debian or MultiFlexi/composer-debian)')
     string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Upstream build number')
-string(name: 'REMOTE_SSH', defaultValue: 'multirepo@repo.multiflexi.eu', description: 'SSH user@host of repository server')
+    string(name: 'REMOTE_SSH', defaultValue: 'multirepo@repo.multiflexi.eu', description: 'SSH user@host of repository server')
     string(name: 'REMOTE_REPO_DIR', defaultValue: '/srv/repo', description: 'Repository base directory')
     string(name: 'COMPONENT', defaultValue: 'main', description: 'Repository component')
     string(name: 'DEB_DIST', defaultValue: '', description: 'Debian/Ubuntu distributions (space or comma separated), can be empty')
@@ -49,23 +49,19 @@ sh label: 'Upload and publish', script: '''
             [ -e "$f" ] || continue
             scp -o StrictHostKeyChecking=no "$f" "$DEST:$REMOTE_REPO_DIR/incoming/"
           done
-# Add each uploaded package into its distro repo with aptly, then remove it remotely and locally
+          # Add all uploaded packages to their respective distro repos using aptly, following official documentation
           DISTS=""
           for f in *.deb; do
             [ -e "$f" ] || continue
             base="$(basename "$f")"
             dist="${base#*~}"; dist="${dist%%_*}"
             repo="${dist}-main-multiflexi"
-            ssh -o StrictHostKeyChecking=no "$DEST" "aptly repo add -force-replace '$repo' '$REMOTE_REPO_DIR/incoming/$base' && rm -f '$REMOTE_REPO_DIR/incoming/$base'" || true
+            # Use -force-replace and -remove-files as recommended by aptly docs
+            ssh -o StrictHostKeyChecking=no "$DEST" "aptly repo add -force-replace -remove-files '$repo' '$REMOTE_REPO_DIR/incoming/$base'" || true
             case " $DISTS " in *" $dist "*) ;; *) DISTS="$DISTS $dist";; esac
             rm -f "$f"
           done
 
-          # For each touched distribution, create snapshot and publish update
-          for dist in $DISTS; do
-            repo="${dist}-main-multiflexi"
-            ssh -o StrictHostKeyChecking=no "$DEST" "repo='$repo'; SNAP=\"\${repo}-\$(date +%Y%m%d%H%M%S)\"; aptly snapshot create \"\$SNAP\" from repo \"\$repo\"; aptly publish update '$dist' || aptly publish snapshot \"\$SNAP\" ." || true
-          done
         '''
       }
     }
