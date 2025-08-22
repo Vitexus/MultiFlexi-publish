@@ -5,6 +5,9 @@ pipeline {
   agent any
 parameters {
     string(name: 'JENKINS_URL', defaultValue: 'https://jenkins.proxy.spojenet.cz', description: 'Jenkins base URL')
+    string(name: 'JENKINS_USER', defaultValue: '', description: 'Jenkins API user (optional, for auto-fix)')
+    string(name: 'JENKINS_TOKEN', defaultValue: '', description: 'Jenkins API token (optional, for auto-fix)')
+    booleanParam(name: 'AUTO_FIX_COPY_PERMISSION', defaultValue: true, description: 'Auto-fix Copy Artifact permission on upstream when credentials provided')
     string(name: 'UPSTREAM_JOB', defaultValue: '', description: 'Upstream job name or full path (e.g., composer-debian or MultiFlexi/composer-debian)')
     string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Upstream build number')
     string(name: 'REMOTE_SSH', defaultValue: 'multirepo@repo.multiflexi.eu', description: 'SSH user@host of repository server')
@@ -14,6 +17,78 @@ parameters {
   }
   options { timestamps() }
   stages {
+    stage('Ensure upstream Copy Artifact permission') {
+      when {
+        expression { return params.AUTO_FIX_COPY_PERMISSION && params.JENKINS_USER?.trim() && params.JENKINS_TOKEN?.trim() }
+      }
+      steps {
+        script {
+          def upstream = params.UPSTREAM_JOB?.trim(); if (!upstream) { error('UPSTREAM_JOB is required') }
+          def projectPath = upstream.contains('/') ? upstream : "MultiFlexi/${upstream}"
+          def projectPathJob = projectPath.split('/').collect{ "job/${it}" }.join('/')
+          def configUrl = "${params.JENKINS_URL}/${projectPathJob}/config.xml"
+          def currentJobFullName = env.JOB_NAME
+          sh label: 'Ensure Copy Artifact permission on upstream', script: """
+            set -e
+            JENKINS_URL="${params.JENKINS_URL}"
+            CONFIG_URL="${configUrl}"
+            USER="${params.JENKINS_USER}"
+            TOKEN="${params.JENKINS_TOKEN}"
+            JOB_FULL_NAME="${currentJobFullName}"
+
+            # Fetch crumb (if any)
+            CRUMB_JSON=$(curl -sf -u "$USER:$TOKEN" "$JENKINS_URL/crumbIssuer/api/json" || true)
+            CRUMB=$(echo "$CRUMB_JSON" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            CRUMB_FIELD=$(echo "$CRUMB_JSON" | sed -n 's/.*"crumbRequestField"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+            TMP=$(mktemp)
+            curl -sf -u "$USER:$TOKEN" "$CONFIG_URL" > "$TMP"
+
+            if grep -q "CopyArtifactPermissionProperty" "$TMP"; then
+              if grep -q "<string>$JOB_FULL_NAME</string>" "$TMP"; then
+                echo "CopyArtifact permission already present for $JOB_FULL_NAME"
+                rm -f "$TMP"
+                exit 0
+              fi
+              awk -v job="$JOB_FULL_NAME" '
+                {print}
+                /<projectNameList>/ {inlist=1}
+                inlist && /<\/projectNameList>/ {print "    <string>"job"</string>"; inlist=0}
+              ' "$TMP" > "$TMP.new"
+            else
+              awk -v job="$JOB_FULL_NAME" '
+                BEGIN{inserted=0}
+                {
+                  print
+                  if(!inserted && $0 ~ /<properties>/){
+                    print "    <hudson.plugins.copyartifact.CopyArtifactPermissionProperty>"
+                    print "      <projectNameList>"
+                    print "        <string>" job "</string>"
+                    print "      </projectNameList>"
+                    print "    </hudson.plugins.copyartifact.CopyArtifactPermissionProperty>"
+                    inserted=1
+                  }
+                }
+              ' "$TMP" > "$TMP.new"
+            fi
+
+            if cmp -s "$TMP" "$TMP.new"; then
+              echo "No changes required to config.xml"
+              rm -f "$TMP" "$TMP.new"
+              exit 0
+            fi
+
+            if [ -n "$CRUMB" ] && [ -n "$CRUMB_FIELD" ]; then
+              curl -sf -u "$USER:$TOKEN" -H "$CRUMB_FIELD: $CRUMB" -H 'Content-Type: application/xml' -X POST --data-binary @"$TMP.new" "$CONFIG_URL"
+            else
+              curl -sf -u "$USER:$TOKEN" -H 'Content-Type: application/xml' -X POST --data-binary @"$TMP.new" "$CONFIG_URL"
+            fi
+            echo "Upstream config.xml updated to allow Copy Artifact from $JOB_FULL_NAME"
+            rm -f "$TMP" "$TMP.new"
+          """
+        }
+      }
+    }
 stage('Fetch artifacts') {
       steps {
         // Clean previous .deb files from workspace to avoid re-uploading old builds
@@ -76,6 +151,52 @@ stage('Fetch artifacts') {
             }
           }
           
+          // Method 4: HTTP download via Jenkins API (requires JENKINS_USER/TOKEN)
+          if (!copySuccess && params.JENKINS_USER?.trim() && params.JENKINS_TOKEN?.trim() && params.JENKINS_URL?.trim()) {
+            echo "Attempting HTTP download of artifacts via Jenkins API..."
+            def httpStatus = sh(returnStatus: true, label: 'HTTP download .deb artifacts', script: """
+              set -e
+              JENKINS_URL='${params.JENKINS_URL}'
+              USER='${params.JENKINS_USER}'
+              TOKEN='${params.JENKINS_TOKEN}'
+              UPSTREAM='${projectPath}'
+              BUILD='${buildNum}'
+              # Build /job/.../job/... path
+              JOB_PATH=$(awk -v p="$UPSTREAM" 'BEGIN{n=split(p,a,"/"); for(i=1;i<=n;i++) printf "/job/%s", a[i]}')
+              JSON_URL="$JENKINS_URL$JOB_PATH/$BUILD/api/json?tree=artifacts[fileName,relativePath]"
+
+              if command -v jq >/dev/null 2>&1; then
+                rels=$(curl -sf -u "$USER:$TOKEN" "$JSON_URL" | jq -r '.artifacts[] | select(.fileName|endswith(".deb")) | .relativePath' || true)
+                if [ -n "$rels" ]; then
+                  echo "$rels" | while IFS= read -r rel; do
+                    echo "Downloading: $rel"
+                    curl -sfL -u "$USER:$TOKEN" -o "$(basename "$rel")" "$JENKINS_URL$JOB_PATH/$BUILD/artifact/$rel"
+                  done
+                else
+                  echo "No .deb artifacts listed by Jenkins API JSON"
+                fi
+              else
+                echo "jq not found; falling back to ZIP download of dist/debian"
+                curl -sfL -u "$USER:$TOKEN" -o debian.zip "$JENKINS_URL$JOB_PATH/$BUILD/artifact/dist/debian/*zip*/debian.zip" || true
+                if [ -s debian.zip ]; then
+                  unzip -o debian.zip >/dev/null
+                  # move any extracted debs into workspace root
+                  find . -maxdepth 3 -type f -name '*.deb' -exec sh -c 'for f; do base=$(basename "$f"); [ -f "$base" ] || cp -f "$f" ./; done' sh {} +
+                  rm -f debian.zip
+                else
+                  echo "ZIP download not available"
+                fi
+              fi
+            """)
+            def hasHttpDebs = sh(returnStatus: true, script: 'ls -1 *.deb >/dev/null 2>&1') == 0
+            if (hasHttpDebs) {
+              copySuccess = true
+              echo 'Downloaded .deb artifacts via Jenkins API successfully'
+            } else {
+              echo 'HTTP download did not retrieve any .deb artifacts'
+            }
+          }
+
           if (!copySuccess) {
             echo "ERROR: All artifact copy methods failed for project '${projectPath}'"
             echo "This may be due to:"
