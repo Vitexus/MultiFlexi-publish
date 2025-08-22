@@ -30,33 +30,33 @@ parameters {
           def currentJobFullName = env.JOB_NAME
           sh label: 'Ensure Copy Artifact permission on upstream', script: """
             set -e
-            JENKINS_URL="${params.JENKINS_URL}"
-            CONFIG_URL="${configUrl}"
-            USER="${params.JENKINS_USER}"
-            TOKEN="${params.JENKINS_TOKEN}"
-            JOB_FULL_NAME="${currentJobFullName}"
+            JENKINS_URL='${params.JENKINS_URL}'
+            CONFIG_URL='${configUrl}'
+            USER='${params.JENKINS_USER}'
+            TOKEN='${params.JENKINS_TOKEN}'
+            JOB_FULL_NAME='${currentJobFullName}'
 
             # Fetch crumb (if any)
-            CRUMB_JSON=$(curl -sf -u "$USER:$TOKEN" "$JENKINS_URL/crumbIssuer/api/json" || true)
-            CRUMB=$(echo "$CRUMB_JSON" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-            CRUMB_FIELD=$(echo "$CRUMB_JSON" | sed -n 's/.*"crumbRequestField"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            CRUMB_JSON=\$(curl -sf -u \"\$USER:\$TOKEN\" \"\$JENKINS_URL/crumbIssuer/api/json\" || true)
+            CRUMB=\$(echo \"\$CRUMB_JSON\" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p')
+            CRUMB_FIELD=\$(echo \"\$CRUMB_JSON\" | sed -n 's/.*"crumbRequestField"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p')
 
-            TMP=$(mktemp)
-            curl -sf -u "$USER:$TOKEN" "$CONFIG_URL" > "$TMP"
+            TMP=\$(mktemp)
+            curl -sf -u \"\$USER:\$TOKEN\" \"\$CONFIG_URL\" > \"\$TMP\"
 
-            if grep -q "CopyArtifactPermissionProperty" "$TMP"; then
-              if grep -q "<string>$JOB_FULL_NAME</string>" "$TMP"; then
-                echo "CopyArtifact permission already present for $JOB_FULL_NAME"
-                rm -f "$TMP"
+            if grep -q "CopyArtifactPermissionProperty" \"\$TMP\"; then
+              if grep -q "<string>\$JOB_FULL_NAME</string>" \"\$TMP\"; then
+                echo "CopyArtifact permission already present for \$JOB_FULL_NAME"
+                rm -f \"\$TMP\"
                 exit 0
               fi
-              awk -v job="$JOB_FULL_NAME" '
+              awk -v job=\"\$JOB_FULL_NAME\" '
                 {print}
                 /<projectNameList>/ {inlist=1}
                 inlist && /<\/projectNameList>/ {print "    <string>"job"</string>"; inlist=0}
-              ' "$TMP" > "$TMP.new"
+              ' \"\$TMP\" > \"\$TMP.new\"
             else
-              awk -v job="$JOB_FULL_NAME" '
+              awk -v job=\"\$JOB_FULL_NAME\" '
                 BEGIN{inserted=0}
                 {
                   print
@@ -69,22 +69,22 @@ parameters {
                     inserted=1
                   }
                 }
-              ' "$TMP" > "$TMP.new"
+              ' \"\$TMP\" > \"\$TMP.new\"
             fi
 
-            if cmp -s "$TMP" "$TMP.new"; then
+            if cmp -s \"\$TMP\" \"\$TMP.new\"; then
               echo "No changes required to config.xml"
-              rm -f "$TMP" "$TMP.new"
+              rm -f \"\$TMP\" \"\$TMP.new\"
               exit 0
             fi
 
-            if [ -n "$CRUMB" ] && [ -n "$CRUMB_FIELD" ]; then
-              curl -sf -u "$USER:$TOKEN" -H "$CRUMB_FIELD: $CRUMB" -H 'Content-Type: application/xml' -X POST --data-binary @"$TMP.new" "$CONFIG_URL"
+            if [ -n \"\$CRUMB\" ] && [ -n \"\$CRUMB_FIELD\" ]; then
+              curl -sf -u \"\$USER:\$TOKEN\" -H \"\$CRUMB_FIELD: \$CRUMB\" -H 'Content-Type: application/xml' -X POST --data-binary @\"\$TMP.new\" \"\$CONFIG_URL\"
             else
-              curl -sf -u "$USER:$TOKEN" -H 'Content-Type: application/xml' -X POST --data-binary @"$TMP.new" "$CONFIG_URL"
+              curl -sf -u \"\$USER:\$TOKEN\" -H 'Content-Type: application/xml' -X POST --data-binary @\"\$TMP.new\" \"\$CONFIG_URL\"
             fi
-            echo "Upstream config.xml updated to allow Copy Artifact from $JOB_FULL_NAME"
-            rm -f "$TMP" "$TMP.new"
+            echo "Upstream config.xml updated to allow Copy Artifact from \$JOB_FULL_NAME"
+            rm -f \"\$TMP\" \"\$TMP.new\"
           """
         }
       }
@@ -162,29 +162,29 @@ stage('Fetch artifacts') {
               UPSTREAM='${projectPath}'
               BUILD='${buildNum}'
               # Build /job/.../job/... path
-              JOB_PATH=$(awk -v p="$UPSTREAM" 'BEGIN{n=split(p,a,"/"); for(i=1;i<=n;i++) printf "/job/%s", a[i]}')
-              JSON_URL="$JENKINS_URL$JOB_PATH/$BUILD/api/json?tree=artifacts[fileName,relativePath]"
+              JOB_PATH=\$(awk -v p=\"\$UPSTREAM\" 'BEGIN{n=split(p,a,"/"); for(i=1;i<=n;i++) printf "/job/%s", a[i]}')
+              JSON_URL=\"\$JENKINS_URL\$JOB_PATH/\$BUILD/api/json?tree=artifacts[fileName,relativePath]\"
 
               if command -v jq >/dev/null 2>&1; then
-                rels=$(curl -sf -u "$USER:$TOKEN" "$JSON_URL" | jq -r '.artifacts[] | select(.fileName|endswith(".deb")) | .relativePath' || true)
-                if [ -n "$rels" ]; then
-                  echo "$rels" | while IFS= read -r rel; do
-                    echo "Downloading: $rel"
-                    curl -sfL -u "$USER:$TOKEN" -o "$(basename "$rel")" "$JENKINS_URL$JOB_PATH/$BUILD/artifact/$rel"
+                rels=\$(curl -sf -u \"\$USER:\$TOKEN\" \"\$JSON_URL\" | jq -r '.artifacts[] | select(.fileName|endswith(\".deb\")) | .relativePath' || true)
+                if [ -n \"\$rels\" ]; then
+                  echo \"\$rels\" | while IFS= read -r rel; do
+                    echo \"Downloading: \$rel\"
+                    curl -sfL -u \"\$USER:\$TOKEN\" -o \"\$(basename \"\$rel\")\" \"\$JENKINS_URL\$JOB_PATH/\$BUILD/artifact/\$rel\"
                   done
                 else
-                  echo "No .deb artifacts listed by Jenkins API JSON"
+                  echo \"No .deb artifacts listed by Jenkins API JSON\"
                 fi
               else
-                echo "jq not found; falling back to ZIP download of dist/debian"
-                curl -sfL -u "$USER:$TOKEN" -o debian.zip "$JENKINS_URL$JOB_PATH/$BUILD/artifact/dist/debian/*zip*/debian.zip" || true
+                echo \"jq not found; falling back to ZIP download of dist/debian\"
+                curl -sfL -u \"\$USER:\$TOKEN\" -o debian.zip \"\$JENKINS_URL\$JOB_PATH/\$BUILD/artifact/dist/debian/*zip*/debian.zip\" || true
                 if [ -s debian.zip ]; then
                   unzip -o debian.zip >/dev/null
                   # move any extracted debs into workspace root
-                  find . -maxdepth 3 -type f -name '*.deb' -exec sh -c 'for f; do base=$(basename "$f"); [ -f "$base" ] || cp -f "$f" ./; done' sh {} +
+                  find . -maxdepth 3 -type f -name '*.deb' -exec sh -c 'for f; do base=\$(basename "\$f"); [ -f "\$base" ] || cp -f "\$f" ./; done' sh {} +
                   rm -f debian.zip
                 else
-                  echo "ZIP download not available"
+                  echo \"ZIP download not available\"
                 fi
               fi
             """)
