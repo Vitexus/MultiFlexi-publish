@@ -23,7 +23,18 @@ stage('Fetch artifacts') {
           def buildNum = params.UPSTREAM_BUILD?.trim(); if (!buildNum) { error('UPSTREAM_BUILD is required') }
           def projectPath = upstream.contains('/') ? upstream : "MultiFlexi/${upstream}"
           echo "Copying .deb artifacts from ${projectPath} #${buildNum}"
-          copyArtifacts projectName: projectPath, selector: specific(buildNum), filter: '**/*.deb', flatten: true, optional: true
+          
+          try {
+            copyArtifacts projectName: projectPath, selector: specific(buildNum), filter: '**/*.deb', flatten: true, optional: true
+            echo "Successfully copied artifacts from ${projectPath}"
+          } catch (Exception e) {
+            echo "Warning: Failed to copy artifacts from ${projectPath}: ${e.getMessage()}"
+            echo "This may be due to:"
+            echo "  - Project '${projectPath}' does not exist"
+            echo "  - Build #${buildNum} does not exist or has no .deb artifacts"
+            echo "  - Insufficient permissions to access the project"
+            echo "Continuing with empty artifact list..."
+          }
         }
       }
     }

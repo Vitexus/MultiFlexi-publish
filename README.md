@@ -54,6 +54,36 @@ This code triggers the `MultiFlexi-publish` job with the required parameters:
 
 The `Jenkinsfile` in this repository contains the necessary steps to automate the process. Adjust paths and repository names as needed for your environment.
 
+## Troubleshooting
+
+### "Unable to find project for artifact copy" Error
+
+If you encounter this error, it means Jenkins cannot find the upstream project:
+
+1. **Check project exists**: Use the debug script to verify the project exists:
+   ```bash
+   export JENKINS_URL="https://jenkins.proxy.spojenet.cz"
+   export JENKINS_USER="your-username"
+   export JENKINS_TOKEN="your-api-token"
+   ./debug-jenkins-projects.sh font-awesome
+   ```
+
+2. **Verify project name**: The upstream job name should match exactly what exists in Jenkins
+
+3. **Check permissions**: Ensure your Jenkins user has permission to access the upstream project
+
+4. **Manual project specification**: If the project is in a different folder, specify the full path:
+   ```groovy
+   string(name: 'UPSTREAM_JOB', value: 'full/path/to/project')
+   ```
+
+### Pipeline Recovery
+
+The pipeline is designed to be fault-tolerant:
+- If no .deb files are found, it will skip the publish stage gracefully
+- Failed artifact copying will log warnings but continue execution
+- SSH operations use error handling to prevent pipeline failures
+
 ## Notes
 
 - Ensure Aptly is properly configured and the repository exists before running the pipeline.
