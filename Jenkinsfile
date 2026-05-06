@@ -249,20 +249,35 @@ stage('Fetch artifacts') {
             base="$(basename "$f")"
             dist="${base#*~}"; dist="${dist%%_*}"
             repo="${dist}-main-multiflexi"
-            echo "Adding $base to repository: $repo"
-            
+            PKG_NAME="$(dpkg-deb -f "$f" Package 2>/dev/null || echo '')"
+            NEW_VER="$(dpkg-deb -f "$f" Version 2>/dev/null || echo '')"
+            echo "Adding $base ($PKG_NAME $NEW_VER) to repository: $repo"
+
             # Use -force-replace and -remove-files as recommended by aptly docs
             if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 "$DEST" "aptly repo add -force-replace -remove-files '$repo' '$REMOTE_REPO_DIR/incoming/$base'"; then
               echo "Successfully added $base to $repo"
+              # Remove all older versions of this package, keeping only the newly added one
+              if [ -n "$PKG_NAME" ] && [ -n "$NEW_VER" ]; then
+                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 "$DEST" \
+                  "aptly repo remove '$repo' 'Name (= $PKG_NAME), !(\$Version (= $NEW_VER))'" && \
+                  echo "Removed old versions of $PKG_NAME from $repo (kept $NEW_VER)" || true
+              fi
             else
               echo "Warning: Failed to add $base to $repo (repository may not exist or aptly error)"
             fi
-            
+
             case " $DISTS " in *" $dist "*) ;; *) DISTS="$DISTS $dist";; esac
             rm -f "$f"
           done
-          
+
           echo "Package processing complete for distributions: $DISTS"
+
+          echo "Publishing updated repositories..."
+          for dist in $DISTS; do
+            echo "Publishing: $dist"
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 "$DEST" \
+              "aptly publish update $dist" || true
+          done
         '''
       }
     }
