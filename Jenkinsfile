@@ -27,6 +27,7 @@ parameters {
     string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Upstream build number')
     string(name: 'REMOTE_SSH', defaultValue: 'multirepo@repo.multiflexi.eu', description: 'SSH user@host of repository server')
     string(name: 'REMOTE_REPO_DIR', defaultValue: '/srv/repo', description: 'Repository base directory')
+    string(name: 'PREFIX', defaultValue: 'multiflexi', description: 'Aptly publish prefix (e.g. multiflexi/<dist>)')
     string(name: 'COMPONENT', defaultValue: 'main', description: 'Repository component')
     string(name: 'DEB_DIST', defaultValue: '', description: 'Debian/Ubuntu distributions (space or comma separated), can be empty')
   }
@@ -222,6 +223,7 @@ stage('Fetch artifacts') {
           set -e
           DEST="${REMOTE_SSH}"
           REMOTE_REPO_DIR="${REMOTE_REPO_DIR}"
+          PREFIX="${PREFIX}"
           COMPONENT="${COMPONENT}"
           DEB_DIST="${DEB_DIST:-}"
 
@@ -259,7 +261,7 @@ stage('Fetch artifacts') {
               # Remove all older versions of this package, keeping only the newly added one
               if [ -n "$PKG_NAME" ] && [ -n "$NEW_VER" ]; then
                 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 "$DEST" \
-                  "aptly repo remove '$repo' 'Name (= $PKG_NAME), !(\$Version (= $NEW_VER))'" && \
+                  "aptly repo remove '$repo' 'Name ($PKG_NAME), !(\$Version ($NEW_VER))'" && \
                   echo "Removed old versions of $PKG_NAME from $repo (kept $NEW_VER)" || true
               fi
             else
@@ -274,9 +276,9 @@ stage('Fetch artifacts') {
 
           echo "Publishing updated repositories..."
           for dist in $DISTS; do
-            echo "Publishing: $dist"
+            echo "Publishing: $PREFIX/$dist"
             ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 "$DEST" \
-              "aptly publish update $dist" || true
+              "aptly publish update $dist '$PREFIX'" || true
           done
         '''
       }
