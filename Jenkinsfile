@@ -27,7 +27,7 @@ parameters {
     string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Upstream build number')
     string(name: 'REMOTE_SSH', defaultValue: 'multirepo@repo.multiflexi.eu', description: 'SSH user@host of repository server')
     string(name: 'REMOTE_REPO_DIR', defaultValue: '/srv/repo', description: 'Repository base directory')
-    string(name: 'PREFIX', defaultValue: 'multiflexi', description: 'Aptly publish prefix (e.g. multiflexi/<dist>)')
+    string(name: 'PREFIX', defaultValue: '', description: 'Aptly publish prefix (leave empty to update the repo at its original, unprefixed publish point)')
     string(name: 'COMPONENT', defaultValue: 'main', description: 'Repository component')
     string(name: 'DEB_DIST', defaultValue: '', description: 'Debian/Ubuntu distributions (space or comma separated), can be empty')
   }
@@ -258,10 +258,17 @@ stage('Fetch artifacts') {
             # Use -force-replace and -remove-files as recommended by aptly docs
             if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 "$DEST" "aptly repo add -force-replace -remove-files '$repo' '$REMOTE_REPO_DIR/incoming/$base'"; then
               echo "Successfully added $base to $repo"
-              # Remove all older versions of this package, keeping only the newly added one
+              # Remove all older versions of this package, keeping only the newly added one.
+              # NOTE: build the query with single-quoted printf so the literal "$Version"
+              # aptly field name never passes through a double-quoted bash/Groovy string —
+              # that previously let Groovy's \$ escape strip the backslash, leaving a bare
+              # $Version for the local shell to expand (to empty), producing a malformed
+              # query that silently over-matched and deleted unrelated packages.
               if [ -n "$PKG_NAME" ] && [ -n "$NEW_VER" ]; then
+                QUERY="$(printf 'Name (%s), !($Version (%s))' "$PKG_NAME" "$NEW_VER")"
+                echo "Prune query: $QUERY"
                 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 "$DEST" \
-                  "aptly repo remove '$repo' 'Name ($PKG_NAME), !(\$Version ($NEW_VER))'" && \
+                  "aptly repo remove '$repo' '$QUERY'" && \
                   echo "Removed old versions of $PKG_NAME from $repo (kept $NEW_VER)" || true
               fi
             else
@@ -276,9 +283,15 @@ stage('Fetch artifacts') {
 
           echo "Publishing updated repositories..."
           for dist in $DISTS; do
-            echo "Publishing: $PREFIX/$dist"
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 "$DEST" \
-              "aptly publish update $dist '$PREFIX'" || true
+            if [ -n "$PREFIX" ]; then
+              echo "Publishing: $PREFIX/$dist"
+              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 "$DEST" \
+                "aptly publish update $dist '$PREFIX'" || true
+            else
+              echo "Publishing: $dist"
+              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 "$DEST" \
+                "aptly publish update $dist" || true
+            fi
           done
         '''
       }
